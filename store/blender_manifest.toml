@@ -1,0 +1,18 @@
+# Weight Manager (权重管理器) — 官方扩展清单
+# 提交到 extensions.blender.org 前，检查 id 未被占用、版本号正确。
+# maintainer/copyright 用的是发布方账号（lunna-sku），如更换请同步。
+schema_version = "1.0.0"
+id = "weight_manager"
+version = "1.9.22"
+name = "Weight Manager (权重管理器)"
+tagline = "Precise C4D/Maya-style weight painting panel for Blender"
+maintainer = "lunna-sku <skulunna@gmail.com>"
+type = "add-on"
+tags = ["Paint", "Rigging"]
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = [
+    "2026 lunna-sku",
+]
+support = "https://github.com/skulunna-blip/blender-weight-manager/issues"  # 审核要求的 bug tracker
+website = "https://github.com/skulunna-blip/blender-weight-manager"          # 主页/源码

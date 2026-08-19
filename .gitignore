@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.zip
+*.log
+test/*_out.txt
+tmp/

@@ -21,7 +21,7 @@ import bpy
 import bmesh
 import math
 
-ADDON_VERSION = (1, 9, 22)
+ADDON_VERSION = (1, 9, 23)
 
 bl_info = {
     "name": "Weight Manager (权重管理器)",
@@ -192,7 +192,8 @@ def _draw_influence_overlay():
     context = bpy.context
     if context.region is None or context.region.type != "WINDOW":
         return
-    if context.mode not in ("EDIT_MESH", "PAINT_WEIGHT"):
+    # 影响范围高亮只在权重绘制模式显示（编辑模式不显示）
+    if context.mode != "PAINT_WEIGHT":
         return
     obj = context.active_object
     if obj is None or obj.type != "MESH":
@@ -221,7 +222,7 @@ def _draw_influence_overlay():
         gpu.matrix.load_projection_matrix(region_data.window_matrix)
         gpu.matrix.multiply_matrix(obj.matrix_world)
         gpu.state.blend_set("ALPHA")
-        gpu.state.point_size_set(7.0)
+        gpu.state.point_size_set(3.0)
         shader.bind()
         shader.uniform_float("color", (1.0, 0.55, 0.05, 0.9))
         batch.draw(shader)
@@ -1013,9 +1014,13 @@ def _draw_weight_hud():
         region_data = context.region_data
         if region_data is None:
             return
-        mx = int(getattr(context, "mouse_region_x", -1000))
-        my = int(getattr(context, "mouse_region_y", -1000))
-        if mx < 0 or my < 0:
+        # draw handler 在渲染时执行，context.mouse_region_x/y 只在事件处理时更新，
+        # 静止时读到 -1 → HUD 永不显示。改用 wm.mouse_position_x/y（窗口坐标，
+        # WM 持续更新，draw 时也可读），再换算到 region 局部坐标（原点 region 左上）。
+        wm = context.window_manager
+        mx = wm.mouse_position_x - region.x
+        my = (region.y + region.height) - wm.mouse_position_y
+        if mx < -1000 or my < -1000:
             return
         vert = _hud_vert_under_cursor(obj, region, region_data, mx, my)
         if vert is None:
@@ -1310,8 +1315,8 @@ class WeightManagerSettings(bpy.types.PropertyGroup):
                      "2/3 = 沿边向外扩展更多层，影响范围更大、平滑更彻底",
     )
     influence_highlight: bpy.props.BoolProperty(
-        name="高亮当前组影响范围", default=True,
-        description="编辑/权重绘制模式下，视口高亮显示当前顶点组影响到的顶点（权重>0，对标 C4D 点关节显示影响范围）",
+        name="高亮当前组影响范围", default=False,
+        description="权重绘制模式下，视口高亮显示当前顶点组影响到的顶点（权重>0，对标 C4D 点关节显示影响范围）",
     )
     joint_filter_active: bpy.props.BoolProperty(
         name="仅显示影响选中点的关节", default=False,

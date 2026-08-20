@@ -20,7 +20,7 @@ import bpy
 import bmesh
 import math
 
-ADDON_VERSION = (1, 9, 26)
+ADDON_VERSION = (1, 9, 27)
 
 bl_info = {
     "name": "Weight Manager (权重管理器)",
@@ -903,107 +903,25 @@ def _draw_edge_overlay():
         pass
 
 
-# ---------------------------------------------------------------- 顶点权重表（选中点 → 所有骨骼权重数字，可编辑）
+# ---------------------------------------------------------------- 顶点列表（选中顶点编号；骨骼权重列表 v1.9.27 已删）
 
-_table_populating = False   # populate 期间置 True：程序设值不触发写入回调
 _table_sel_sig = None       # 缓存：上次的选中点 tuple
-_table_active_vert = None   # 缓存：上次的激活顶点索引
-_table_last_groups = -1     # 缓存：上次的顶点组数量（删除组会错位 group_index，必须重建）
 _table_dirty = False        # 有待执行的延迟重建（draw 回调禁止写 ID 属性，延迟到 timer）
 _table_waiting = None       # timer 待执行时捕获的 (context, obj, settings)——timer 里不用
                             # bpy.context（那个状态不可靠），直接用捕获的引用
 
 
-def _on_table_weight(self, context):
-    """顶点权重表某行权重滑块的回调：把值写入该行骨骼在此顶点上的权重。
-
-    self = 行 item（有自己的 group_index + weight），每行独立——不存在共享属性被
-    最后一行覆盖的问题（Bug B 的教训）。
-    """
-    global _table_populating
-    if _table_populating:
-        return
-    obj = context.active_object
-    if obj is None or obj.type != "MESH":
-        return
-    settings = getattr(context.scene, "weight_manager", None)
-    if settings is None:
-        return
-    verts = settings.vert_table_verts
-    if not verts:
-        return
-    idx = settings.vert_table_index
-    if idx < 0 or idx >= len(verts):
-        return
-    vert = verts[idx].vert_index
-    if vert < 0 or vert >= len(obj.data.vertices):
-        return
-    gi = self.group_index
-    if gi < 0 or gi >= len(obj.vertex_groups):
-        return
-    if _vg_locked(obj.vertex_groups[gi]):
-        return
-    weight_tools.set_weights(obj, [vert], gi, self.weight)
-    _finish_edit(context, obj, None)
-
-
-def _read_vert_all(obj, vert):
-    """读一个顶点在**所有**顶点组上的权重（一次读取，跨模式）。"""
-    n = len(obj.vertex_groups)
-    if n == 0:
-        return []
-    if obj.mode == "EDIT":
-        bm, d = weight_tools._get_bm(obj)
-        data = bm.verts[vert][d]
-        return [data.get(i, 0.0) for i in range(n)]
-    return [weight_tools._weight(vg, vert) for vg in obj.vertex_groups]
-
-
 def _sync_weight_table(context, obj, settings):
-    """面板 draw 调用：只读判断权重表是否需要重建；需要时把写入延迟到 timer。
+    """面板 draw 调用：顶点列表只在选中点变化时重建；重建延迟到 timer。
 
     **🔴 draw 回调禁止修改 ID 属性**——直接对 settings 的 CollectionProperty
     clear()/add() 会报 "Writing to ID classes in this context is not allowed"
     （Blender GUI 才触发，无头测不到）。所以 draw 里只比较签名，真正清空/重建
     CollectionProperty 交给 `_table_write_timer`（非 draw 上下文）执行。
-
-    只在「选中点变化 / 激活顶点变化 / 顶点组数量变化 / 显示值与实际值不一致」时
-    重建——滑块拖动期间集合不重建，输入不被打断；也避免 写入→重绘→重建→写入
-    死循环（拖动时行值已被 UI 设为新值 == mesh 值，一致性检查不会误触发）。
     """
-    global _table_sel_sig, _table_last_groups
-    indices = _get_indices(context, obj)
-    sig = tuple(indices)
-    sel_changed = sig != _table_sel_sig
-    groups_changed = len(obj.vertex_groups) != _table_last_groups
-
-    # 无选中顶点：仅当选中/组数变化时清空行表
-    if not settings.vert_table_verts:
-        if sel_changed or groups_changed:
-            _schedule_table_write(context, obj, settings)
-        return
-
-    idx = settings.vert_table_index
-    if idx >= len(settings.vert_table_verts):
-        idx = 0
-    vert = settings.vert_table_verts[idx].vert_index
-    if vert < 0 or vert >= len(obj.data.vertices):
-        return
-
-    needs_rebuild = sel_changed or groups_changed or vert != _table_active_vert
-    if not needs_rebuild:
-        # 用顶部 Auto Weight / 其它操作改了同一顶点的权重时，表格值会过期——核对一次
-        #（O(组数) 单顶点读取，很便宜），不一致才重建。group_index 越界本身也算过期
-        #（正常不会出现，防御而已），重建即校正。
-        actual = _read_vert_all(obj, vert)
-        if any(r.group_index < 0 or r.group_index >= len(actual)
-               for r in settings.vert_table_rows):
-            needs_rebuild = True
-        elif any(abs(r.weight - actual[r.group_index]) > 1e-5
-                 for r in settings.vert_table_rows):
-            needs_rebuild = True
-
-    if needs_rebuild:
+    global _table_sel_sig
+    sig = tuple(_get_indices(context, obj))
+    if sig != _table_sel_sig:
         _schedule_table_write(context, obj, settings)
 
 
@@ -1038,65 +956,28 @@ def _table_write_timer():
 
 
 def _table_write_now(context, obj, settings):
-    """重建顶点权重表两份列表（选中顶点 + 激活顶点的所有骨骼行）。
+    """重建顶点列表（选中顶点）。
 
     只读签名判断在 `_sync_weight_table`（draw）里做；这里只执行写入。
     参数由 `_sync_weight_table` 捕获传进来，timer 里不依赖 bpy.context 的状态。
     """
-    global _table_populating, _table_sel_sig, _table_active_vert, _table_last_groups
+    global _table_sel_sig
     if obj is None or obj.type != "MESH":
         return
     if settings is None:
         return
     indices = _get_indices(context, obj)
-    sig = tuple(indices)
-    _table_populating = True
-    try:
-        _table_sel_sig = sig
-        settings.vert_table_verts.clear()
-        for vi in indices:
-            settings.vert_table_verts.add().vert_index = vi
-        if settings.vert_table_index >= len(settings.vert_table_verts):
-            settings.vert_table_index = 0
-        _table_last_groups = len(obj.vertex_groups)
-        if not settings.vert_table_verts:
-            settings.vert_table_rows.clear()
-            _table_active_vert = None
-            return
-        idx = settings.vert_table_index
-        if idx >= len(settings.vert_table_verts):
-            idx = 0
-        vert = settings.vert_table_verts[idx].vert_index
-        if vert < 0 or vert >= len(obj.data.vertices):
-            settings.vert_table_rows.clear()
-            _table_active_vert = None
-            return
-        _table_active_vert = vert
-        settings.vert_table_rows.clear()
-        rows = [(g.index, weight_tools._read_all(obj, g.index, [vert])[0])
-                for g in obj.vertex_groups]
-        rows.sort(key=lambda r: -r[1])   # 权重降序，0 在最底（把 0 调大 = 给顶点加骨骼）
-        settings.vert_table_row_index = 0   # 重建后 active 行归位，避免越界
-        for gi, w in rows:
-            settings.vert_table_rows.add().group_index = gi
-            settings.vert_table_rows[-1].weight = w
-    finally:
-        _table_populating = False
+    _table_sel_sig = tuple(indices)
+    settings.vert_table_verts.clear()
+    for vi in indices:
+        settings.vert_table_verts.add().vert_index = vi
+    if settings.vert_table_index >= len(settings.vert_table_verts):
+        settings.vert_table_index = 0
 
 
 class WeightTableVert(bpy.types.PropertyGroup):
     """顶点权重表：一行 = 一个选中顶点。"""
     vert_index: bpy.props.IntProperty(name="顶点索引", default=0)
-
-
-class WeightTableRow(bpy.types.PropertyGroup):
-    """顶点权重表：一行 = 激活顶点的一根骨骼 + 它的权重（每行独立可编辑）。"""
-    group_index: bpy.props.IntProperty(name="骨骼索引", default=-1)
-    weight: bpy.props.FloatProperty(
-        name="权重", default=0.0, min=0.0, max=1.0,
-        precision=3, subtype="FACTOR", update=_on_table_weight,
-        description="该骨骼在此顶点上的权重（拖动滑块实时写入）",
-    )
 
 
 # ---------------------------------------------------------------- 设置
@@ -1203,9 +1084,7 @@ class WeightManagerSettings(bpy.types.PropertyGroup):
         description="权重绘制模式下用橙色线高亮边环选择选中的边环（权重模式没有原生边高亮）",
     )
     vert_table_verts: bpy.props.CollectionProperty(type=WeightTableVert)
-    vert_table_rows: bpy.props.CollectionProperty(type=WeightTableRow)
     vert_table_index: bpy.props.IntProperty(default=0)
-    vert_table_row_index: bpy.props.IntProperty(default=0)
 
 
 # ---------------------------------------------------------------- Operators
@@ -2022,15 +1901,6 @@ class WM_UL_VertexGroups(bpy.types.UIList):
         if lock_prop:
             row.prop(vg, lock_prop, text="",
                       icon="LOCKED" if _vg_locked(vg) else "UNLOCKED", emboss=False)
-        # 百分比：每行右侧展示当前组在选中顶点上的平均权重（对标 C4D Joints 列表的小色条）。
-        # v1.9.26：原实现用 split.box() 画两格色条，但 box 是深色容器且两段总占满整行宽度
-        # ——列表有行就整行铺两个深色 box，视觉上像「黑底盖住列表」（用户反馈黑条）。改成
-        # 文字百分比：信息保留、无深色块。数值本身是每行当场算的，与 Blender 批量渲染的
-        # 共享属性坑（Bug B）无关。
-        if context.mode in ("EDIT_MESH", "PAINT_WEIGHT") and obj.type == "MESH":
-            pv = _ul_weight_preview(context, obj, vg)
-            if pv > 0.0:
-                row.label(text=f"{pv*100:.0f}%", text_align="RIGHT")
 
 
 class WM_UL_WeightVerts(bpy.types.UIList):
@@ -2043,33 +1913,6 @@ class WM_UL_WeightVerts(bpy.types.UIList):
         row = layout.row(align=True)
         row.label(text="", icon="VERTEXSEL")
         row.label(text=f"顶点 {item.vert_index}")
-
-
-class WM_UL_WeightRows(bpy.types.UIList):
-    """顶点权重表·骨骼权重列表：激活顶点的所有骨骼 + 每行可拖权重滑条（按权重降序）。
-
-    每行是一个独立 WeightTableRow 实例（有自己的 weight 属性）——不是共享 FloatProperty，
-    不会出现所有行显示同一个值的问题（Bug B 的教训）。锁定组行置灰（enabled=False）。
-    """
-
-    def filter_items(self, context, data, property):
-        return [], []
-
-    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        # 注意：data 是 settings（rows 的 template_list 绑在 settings.vert_table_rows 上），
-        # 没有 vertex_groups——必须从 context.active_object 拿骨骼（早期版本误用
-        # data.vertex_groups，GUI 里 AttributeError 每行刷屏）。
-        obj = context.active_object
-        gi = item.group_index
-        vg = obj.vertex_groups[gi] if (obj and 0 <= gi < len(obj.vertex_groups)) else None
-        locked = _vg_locked(vg) if vg is not None else True
-        row = layout.row(align=True)
-        if locked:
-            row.enabled = False   # 锁定骨骼整行只读
-        row.label(text=vg.name if vg is not None else "?", icon="GROUP_BONE")
-        # 精度在 WeightTableRow.weight 的 FloatProperty(precision=3) 定义里，
-        # UILayout.prop() 不接收 precision 关键字（Blender 4.x/5.x 都不接收，传了就 TypeError）。
-        row.prop(item, "weight", text="", slider=True)
 
 
 # ---------------------------------------------------------------- 面板
@@ -2266,22 +2109,16 @@ class VIEW3D_PT_WeightManager(bpy.types.Panel):
             col.label(text="未安装「Fill Select 填充选择」插件", icon="ERROR")
             col.label(text="需要它来选中边界环之间的面", icon="QUESTION")
 
-        # ---------- 顶点权重表（选中点 → 所有骨骼权重数字，可编辑，对标 Maya Component Editor） ----------
+        # ---------- 选中顶点列表（原顶点权重表的骨骼权重编辑列表 v1.9.27 已删） ----------
         if can_edit:
             _sync_weight_table(context, obj, settings)
             box = layout.box()
-            box.label(text="顶点权重表", icon="FILE_TEXT")
+            box.label(text="选中顶点列表", icon="FILE_TEXT")
             if settings.vert_table_verts:
                 row = box.row()
                 row.template_list(
                     "WM_UL_WeightVerts", "", settings, "vert_table_verts",
                     settings, "vert_table_index", rows=4)
-                if settings.vert_table_rows:
-                    box.template_list(
-                        "WM_UL_WeightRows", "", settings, "vert_table_rows",
-                        settings, "vert_table_row_index", rows=6)
-                else:
-                    box.label(text="（该顶点没有任何骨骼权重）", icon="INFO")
             else:
                 box.label(text="先选中顶点/面（编辑或权重模式）", icon="RESTRICT_SELECT_OFF")
 
@@ -2290,11 +2127,9 @@ class VIEW3D_PT_WeightManager(bpy.types.Panel):
 
 _classes = (
     WeightTableVert,
-    WeightTableRow,
     WeightManagerSettings,
     WM_UL_VertexGroups,
     WM_UL_WeightVerts,
-    WM_UL_WeightRows,
     WeightOT_Apply,
     WeightOT_Smooth,
     WeightOT_Invert,

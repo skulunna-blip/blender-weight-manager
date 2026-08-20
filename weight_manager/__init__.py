@@ -8,7 +8,6 @@
 - Commands：反转 / 镜像 / 复制黏贴
 - 按权重填充选择（=0 >0 <1 =1 区间）
 - 顶点权重表：选中点 → 显示所有骨骼的权重数字，可直接拖滑条改（对标 Maya Component Editor）
-- 权重 HUD：视口光标旁实时显示当前骨骼在鼠标所指顶点上的权重值
 - 边环选择（C4D 式）：面板「进入选边模式」按钮 → 在 3D 视口像编辑模式一样选边（单击选单条边、
   Alt+单击 选整条循环边、Shift 加选 / 点击已选边取消、Ctrl+单击 最短路径；编辑/权重绘制模式均可），
   橙色 overlay 高亮；「选填充面轮廓边」按钮 = 权重模式对标编辑模式「选择边界环」，把 Fill Select
@@ -21,7 +20,7 @@ import bpy
 import bmesh
 import math
 
-ADDON_VERSION = (1, 9, 24)
+ADDON_VERSION = (1, 9, 25)
 
 bl_info = {
     "name": "Weight Manager (权重管理器)",
@@ -128,9 +127,8 @@ def _joint_filter_flags(obj, sel_indices, name_filter="", influence_only=False, 
 # ---------------------------------------------------------------- 影响范围高亮（视口 overlay）
 
 _draw_handle = None       # SpaceView3D.draw_handler_add 返回的句柄
-_infl_cache_key = None    # (id(mesh), vg_index)
-_infl_cache_coords = []
-_infl_cache_ts = 0.0
+_infl_cache = {}          # {(id(mesh), vg_index): (timestamp, coords)} —— 多组高亮各自缓存
+_highlight_groups = set()  # 用户眼睛勾选、要叠加高亮的骨骼索引（配合主开关）
 
 # 注册防冲突（v1.9.0 修复）：插件同时装成传统 addon + 扩展时两个副本都会 register()。
 # Blender 5 对已注册类做『注销先前+重注册』（register_class C 层），会连带注销
@@ -152,14 +150,15 @@ def _influence_coords(obj, vg_idx):
     """当前顶点组权重>ε 的顶点坐标列表（视口高亮数据源）。
 
     带缓存：切换组立即刷新（key 变化），连续编辑权重时最长 ~0.35s 延迟一次
-    （避免每帧重扫整个网格）。编辑模式走 live bmesh 只读，其它模式直读 mesh。
+    （避免每帧重扫整个网格）。多组高亮各自缓存（v1.9.25）。编辑模式走 live
+    bmesh 只读，其它模式直读 mesh。
     """
-    global _infl_cache_key, _infl_cache_coords, _infl_cache_ts
     import time
     key = (id(obj.data), vg_idx)
     now = time.time()
-    if key == _infl_cache_key and now - _infl_cache_ts < 0.35:
-        return _infl_cache_coords
+    hit = _infl_cache.get(key)
+    if hit is not None and now - hit[0] < 0.35:
+        return hit[1]
     if obj.mode == "EDIT":
         bm = bmesh.from_edit_mesh(obj.data)
         d = bm.verts.layers.deform.verify()
@@ -170,9 +169,7 @@ def _influence_coords(obj, vg_idx):
         vg = obj.vertex_groups[vg_idx]
         coords = [tuple(v.co) for v in obj.data.vertices
                   if weight_tools._weight(vg, v.index) > 1e-4]
-    _infl_cache_key = key
-    _infl_cache_coords = coords
-    _infl_cache_ts = now
+    _infl_cache[key] = (now, coords)
     return coords
 
 
@@ -207,10 +204,15 @@ def _draw_influence_overlay():
     region_data = context.region_data
     if region_data is None:
         return
-    try:
-        coords = _influence_coords(obj, vg.index)
-    except Exception:
-        return
+    # 收集 active 组 + 眼睛勾选的多组影响范围，合并成一个 batch（v1.9.25 多骨骼高亮）
+    idxs = [vg.index]
+    idxs += sorted(i for i in _highlight_groups if i != vg.index)
+    coords = []
+    for gi in idxs:
+        try:
+            coords.extend(_influence_coords(obj, gi))
+        except Exception:
+            continue
     if not coords:
         return
     import gpu
@@ -258,7 +260,7 @@ def _pick_edge_from_ray(obj, bm, origin, direction):
     `bpy.ops.mesh.loop_multi_select()`（编辑模式 Alt+点击同款算法，v1.9.10 起）。
 
     origin/direction 是世界坐标——BMesh 是物体本地坐标，必须经 matrix_world
-    逆变换（同 HUD 的坑）。
+    逆变换。
 
     **不用 obj.ray_cast**：它打在「应用修改器后」的网格上，返回的面索引对应
     修改后的网格；原始 bmesh 面数不同（细分/镜像等修改器），索引会错位甚至
@@ -901,139 +903,6 @@ def _draw_edge_overlay():
         pass
 
 
-# ---------------------------------------------------------------- 权重 HUD（视口光标权重值）
-
-_hud_handle = None   # 权重 HUD 的 draw handler 句柄（POST_PIXEL，画 2D 文字）
-# HUD 射线用的原始网格 BVHTree 缓存：key=(id(mesh), 顶点数, 面数)。
-# 不每帧重建 bmesh（开销大），几何没变时复用；权重绘制时网格几何不变，安全。
-# 与边环选择同理：obj.ray_cast 打在修改器后的网格上，面索引对应不上原始网格。
-_hud_bvh_key = None
-_hud_bvh = None
-
-
-def _hud_mesh_bvh(obj):
-    """原始网格（不含修改器）的 BVHTree，带缓存。"""
-    global _hud_bvh_key, _hud_bvh
-    key = (id(obj.data), len(obj.data.vertices), len(obj.data.polygons))
-    if key != _hud_bvh_key:
-        bm = bmesh.new()
-        try:
-            bm.from_mesh(obj.data)
-            bm.faces.ensure_lookup_table()
-            from mathutils.bvhtree import BVHTree
-            _hud_bvh = BVHTree.FromBMesh(bm)
-        finally:
-            bm.free()
-        _hud_bvh_key = key
-    return _hud_bvh
-
-
-def _hud_vert_under_cursor(obj, region, region_data, mx, my):
-    """鼠标所指顶点的索引（射线打在面上的最近顶点）；射不到网格返回 None。"""
-    from bpy_extras import view3d_utils
-    try:
-        origin = view3d_utils.region_2d_to_origin_3d(region, region_data, (mx, my))
-        direction = view3d_utils.region_2d_to_vector_3d(region, region_data, (mx, my))
-    except Exception:
-        return None
-    try:
-        # obj.ray_cast 的射线是**物体本地坐标**，而 region_2d_to_* 给的是世界坐标——
-        # 物体有位移/旋转/缩放时不过矩阵逆变换，射线会射空（HUD 永不显示）。
-        # 注意：Blender 5.0 的 ray_cast 返回 **4 元组** (result, location, normal, index)
-        #（早期版本按 5 元组带 distance 解包会 ValueError，被吞掉后 HUD 永不显示）。
-        # 且不能用 obj.ray_cast：修改器后网格的面索引对应不上原始网格，改射原始 BVHTree。
-        m_inv = obj.matrix_world.inverted()
-        o = m_inv @ origin
-        d = (m_inv.to_3x3() @ direction).normalized()
-        loc, _n, index, _dist = _hud_mesh_bvh(obj).ray_cast(o, d)
-    except Exception:
-        return None
-    # BVHTree.ray_cast 射空返回 index=-1（旧 obj.ray_cast 才有 (ok, ...) 元组，
-    # 改成 BVHTree 后不再有 ok 变量——漏删会 NameError，HUD 永不开）
-    if index < 0 or index >= len(obj.data.polygons):
-        return None
-    face = obj.data.polygons[index]
-    co = obj.data.vertices
-    best, best_d = -1, float("inf")
-    for vi in face.vertices:
-        d = (co[vi].co - loc).length_squared
-        if d < best_d:
-            best, best_d = vi, d
-    return best
-
-
-def _hud_draw_text(mx, my, text):
-    """在鼠标旁画一行带深色底的小字（POST_PIXEL，像素坐标，原点在区域左上）。"""
-    import blf
-    import gpu
-    from gpu_extras.batch import batch_for_shader
-    font_id = 0
-    blf.size(font_id, 15, 72)
-    w, h = blf.dimensions(font_id, text)
-    x, y = mx + 16, my + 12
-    pad = 4
-    quad = (
-        (x - pad, y - pad), (x + w + pad, y - pad),
-        (x + w + pad, y + h + pad), (x - pad, y + h + pad),
-    )
-    gpu.state.blend_set("ALPHA")
-    try:
-        shader = _builtin_shader("2D_UNIFORM_COLOR")
-        batch = batch_for_shader(shader, "TRI_FAN", {"pos": quad})
-        shader.bind()
-        shader.uniform_float("color", (0.0, 0.0, 0.0, 0.6))
-        batch.draw(shader)
-    finally:
-        gpu.state.blend_set("NONE")
-    blf.position(font_id, x, y, 0)
-    blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
-    blf.draw(font_id, text)
-
-
-def _draw_weight_hud():
-    """视口 HUD：光标旁显示当前骨骼在鼠标所指顶点的权重值（对标 C4D 权重 HUD）。
-
-    挂在 POST_PIXEL draw handler 上。整段 try/except——draw handler 任何异常都不能崩掉视口。
-    """
-    context = bpy.context
-    try:
-        if context.region is None or context.region.type != "WINDOW":
-            return
-        if context.mode not in ("EDIT_MESH", "PAINT_WEIGHT"):
-            return
-        obj = context.active_object
-        if obj is None or obj.type != "MESH":
-            return
-        settings = getattr(context.scene, "weight_manager", None)
-        if settings is None or not settings.weight_hud:
-            return
-        vg = _active_vg(obj)
-        if vg is None:
-            return
-        region = context.region
-        region_data = context.region_data
-        if region_data is None:
-            return
-        # draw handler 在渲染时执行，context.mouse_region_x/y 只在事件处理时更新，
-        # 静止时读到 -1 → HUD 永不显示。改用 wm.mouse_position_x/y（窗口坐标，
-        # WM 持续更新，draw 时也可读），再换算到 region 局部坐标（原点 region 左上）。
-        wm = context.window_manager
-        mx = wm.mouse_position_x - region.x
-        my = (region.y + region.height) - wm.mouse_position_y
-        # region 边界裁剪：鼠标移到侧栏/区域外时 mx/my 会算出 region 外坐标，
-        # 不裁剪的话 HUD 黑色底文字会画到面板列表上（v1.9.23 回归：换用
-        # wm.mouse_position 全局坐标后没补边界判断）。
-        if not (0 <= mx < region.width and 0 <= my < region.height):
-            return
-        vert = _hud_vert_under_cursor(obj, region, region_data, mx, my)
-        if vert is None:
-            return
-        w = weight_tools._read_all(obj, vg.index, [vert])[0]
-        _hud_draw_text(mx, my, f"{vg.name}: {w:.3f}")
-    except Exception:
-        pass
-
-
 # ---------------------------------------------------------------- 顶点权重表（选中点 → 所有骨骼权重数字，可编辑）
 
 _table_populating = False   # populate 期间置 True：程序设值不触发写入回调
@@ -1328,10 +1197,6 @@ class WeightManagerSettings(bpy.types.PropertyGroup):
     joint_filter_name: bpy.props.StringProperty(
         name="搜索关节", default="", maxlen=63,
         description="Joint Filter：按名称子串过滤顶点组列表",
-    )
-    weight_hud: bpy.props.BoolProperty(
-        name="权重 HUD", default=False,
-        description="视口光标旁实时显示当前骨骼在鼠标所指顶点上的权重值（对标 C4D 权重 HUD，仅编辑/权重绘制模式）",
     )
     edge_loop_highlight: bpy.props.BoolProperty(
         name="高亮选中的边环", default=True,
@@ -2101,6 +1966,31 @@ class WeightOT_GroupRename(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class WeightOT_ToggleHighlight(bpy.types.Operator):
+    """勾选/取消该骨骼的影响范围高亮（可同时勾选多个，对比多骨骼权重分布）"""
+    bl_idname = "weight.toggle_highlight"
+    bl_label = "切换骨骼影响范围高亮"
+    bl_options = {"REGISTER"}
+
+    group_index: bpy.props.IntProperty(default=-1)
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "MESH" and obj.vertex_groups
+
+    def execute(self, context):
+        global _highlight_groups
+        if self.group_index in _highlight_groups:
+            _highlight_groups.discard(self.group_index)
+        else:
+            _highlight_groups.add(self.group_index)
+        area = context.area
+        if area:
+            area.tag_redraw()
+        return {"FINISHED"}
+
+
 # ---------------------------------------------------------------- 列表控件
 
 class WM_UL_VertexGroups(bpy.types.UIList):
@@ -2122,6 +2012,11 @@ class WM_UL_VertexGroups(bpy.types.UIList):
         vg = item
         obj = data
         row = layout.row(align=True)
+        # 眼睛 toggle：勾选该骨骼 → 视口叠加高亮它的影响范围（可同时勾选多个，
+        # 方便对比多骨骼权重分布；v1.9.25 多骨骼高亮）
+        op = row.operator("weight.toggle_highlight", text="", emboss=False,
+                          icon="RESTRICT_SELECT_OFF" if index in _highlight_groups else "RESTRICT_SELECT_ON")
+        op.group_index = index
         row.label(text=vg.name, icon="GROUP_BONE")
         lock_prop = "lock_weight" if hasattr(vg, "lock_weight") else ("lock" if hasattr(vg, "lock") else None)
         if lock_prop:
@@ -2251,10 +2146,7 @@ class VIEW3D_PT_WeightManager(bpy.types.Panel):
             box.label(text="（需编辑/权重模式才能按选中点过滤，先选中点/面）", icon="INFO")
         # 影响范围高亮（对标 C4D：点关节 → 视口高亮它的影响范围）
         row = box.row(align=True)
-        row.prop(settings, "influence_highlight", text="高亮当前组影响范围", icon="RESTRICT_SELECT_OFF", toggle=True)
-        # 权重 HUD（光标旁权重值，对标 C4D 视口 HUD）
-        row = box.row(align=True)
-        row.prop(settings, "weight_hud", text="权重 HUD（光标权重值）", icon="HIDE_OFF", toggle=True)
+        row.prop(settings, "influence_highlight", text="高亮影响范围（眼睛选多骨骼）", icon="RESTRICT_SELECT_OFF", toggle=True)
         box.template_list(
             "WM_UL_VertexGroups", "", obj, "vertex_groups",
             obj.vertex_groups, "active_index", rows=4)
@@ -2419,12 +2311,13 @@ _classes = (
     WeightOT_GroupNew,
     WeightOT_GroupDelete,
     WeightOT_GroupRename,
+    WeightOT_ToggleHighlight,
     VIEW3D_PT_WeightManager,
 )
 
 
 def register():
-    global _registered, _draw_handle, _hud_handle, _edge_handle
+    global _registered, _draw_handle, _edge_handle
     if _registered:
         return  # 本副本已注册（同一进程重复 enable），直接跳过
     # 惰性保护：任何同名类已存在于 bpy.types → 说明传统副本或扩展副本已注册，
@@ -2448,12 +2341,6 @@ def register():
             _draw_influence_overlay, (), "WINDOW", "POST_VIEW")
     except Exception:
         _draw_handle = None
-    # 视口权重 HUD（光标旁权重值；同上，挂不上就跳过）
-    try:
-        _hud_handle = bpy.types.SpaceView3D.draw_handler_add(
-            _draw_weight_hud, (), "WINDOW", "POST_PIXEL")
-    except Exception:
-        _hud_handle = None
     # 视口边环高亮 overlay（权重模式补边高亮；同上，挂不上就跳过）
     try:
         _edge_handle = bpy.types.SpaceView3D.draw_handler_add(
@@ -2485,7 +2372,7 @@ def register():
 
 
 def unregister():
-    global _registered, _draw_handle, _hud_handle, _edge_handle
+    global _registered, _draw_handle, _edge_handle
     if not _registered:
         return  # 本副本从未注册（惰性副本 / 已被别处注销），什么都不碰
     _registered = False
@@ -2495,12 +2382,6 @@ def unregister():
         except Exception:
             pass
         _draw_handle = None
-    if _hud_handle is not None:
-        try:
-            bpy.types.SpaceView3D.draw_handler_remove(_hud_handle, "WINDOW")
-        except Exception:
-            pass
-        _hud_handle = None
     if _edge_handle is not None:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(_edge_handle, "WINDOW")

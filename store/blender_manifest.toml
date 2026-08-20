@@ -3,7 +3,7 @@
 # maintainer/copyright 用的是发布方账号（lunna-sku），如更换请同步。
 schema_version = "1.0.0"
 id = "weight_manager"
-version = "1.9.25"
+version = "1.9.26"
 name = "Weight Manager (权重管理器)"
 tagline = "Precise C4D/Maya-style weight painting panel for Blender"
 maintainer = "lunna-sku <skulunna@gmail.com>"

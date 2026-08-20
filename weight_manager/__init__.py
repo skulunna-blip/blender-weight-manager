@@ -20,7 +20,7 @@ import bpy
 import bmesh
 import math
 
-ADDON_VERSION = (1, 9, 25)
+ADDON_VERSION = (1, 9, 26)
 
 bl_info = {
     "name": "Weight Manager (权重管理器)",
@@ -2022,16 +2022,15 @@ class WM_UL_VertexGroups(bpy.types.UIList):
         if lock_prop:
             row.prop(vg, lock_prop, text="",
                       icon="LOCKED" if _vg_locked(vg) else "UNLOCKED", emboss=False)
-        # 百分比条：每行右侧展示当前组在选中顶点上的平均权重（对标 C4D Joints 列表的小色条）。
-        # 不能用共享 FloatProperty 每行写入——Blender 在 draw_item 全部结束后才渲染按钮值，
-        # 共享属性会被最后一行覆盖，导致所有行显示同一个值；VertexGroup 又不支持动态属性，
-        # 所以用 row.split() 自绘比例条：值当场算、当场按比例切分两格，每行独立正确。
+        # 百分比：每行右侧展示当前组在选中顶点上的平均权重（对标 C4D Joints 列表的小色条）。
+        # v1.9.26：原实现用 split.box() 画两格色条，但 box 是深色容器且两段总占满整行宽度
+        # ——列表有行就整行铺两个深色 box，视觉上像「黑底盖住列表」（用户反馈黑条）。改成
+        # 文字百分比：信息保留、无深色块。数值本身是每行当场算的，与 Blender 批量渲染的
+        # 共享属性坑（Bug B）无关。
         if context.mode in ("EDIT_MESH", "PAINT_WEIGHT") and obj.type == "MESH":
             pv = _ul_weight_preview(context, obj, vg)
             if pv > 0.0:
-                split = row.split(factor=min(0.98, pv), align=True)
-                split.box().label(text=" ")
-                split.box().label(text=" ")
+                row.label(text=f"{pv*100:.0f}%", text_align="RIGHT")
 
 
 class WM_UL_WeightVerts(bpy.types.UIList):

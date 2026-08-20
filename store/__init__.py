@@ -21,7 +21,7 @@ import bpy
 import bmesh
 import math
 
-ADDON_VERSION = (1, 9, 23)
+ADDON_VERSION = (1, 9, 24)
 
 bl_info = {
     "name": "Weight Manager (权重管理器)",
@@ -1020,7 +1020,10 @@ def _draw_weight_hud():
         wm = context.window_manager
         mx = wm.mouse_position_x - region.x
         my = (region.y + region.height) - wm.mouse_position_y
-        if mx < -1000 or my < -1000:
+        # region 边界裁剪：鼠标移到侧栏/区域外时 mx/my 会算出 region 外坐标，
+        # 不裁剪的话 HUD 黑色底文字会画到面板列表上（v1.9.23 回归：换用
+        # wm.mouse_position 全局坐标后没补边界判断）。
+        if not (0 <= mx < region.width and 0 <= my < region.height):
             return
         vert = _hud_vert_under_cursor(obj, region, region_data, mx, my)
         if vert is None:
